@@ -226,15 +226,14 @@ def create_detailed_report(sites_df: pd.DataFrame, strikes_df: pd.DataFrame, rad
     with open(filename, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['Site Name', 'Latitude', 'Longitude', 
-                        f'Strikes ({radii[0]} mi)', f'Strikes ({radii[1]} mi)'])
+                        f'Strikes ({radii[0]} mi)'])
         
         for _, site in sites_df.iterrows():
             # Get strikes for each radius
             strikes_1mi = get_strikes_for_site(site, strikes_df, radii[0])
-            strikes_5mi = get_strikes_for_site(site, strikes_df, radii[1])
             
             # Skip sites with no strikes in either radius
-            if not strikes_1mi and not strikes_5mi:
+            if not strikes_1mi:
                 continue
                 
             sites_with_strikes += 1
@@ -244,8 +243,7 @@ def create_detailed_report(sites_df: pd.DataFrame, strikes_df: pd.DataFrame, rad
                 site['SiteName'],
                 site['Latitude'],
                 site['Longitude'],
-                len(strikes_1mi),
-                len(strikes_5mi)
+                len(strikes_1mi)
             ])
             
             # Write 1-mile radius strikes
@@ -259,19 +257,6 @@ def create_detailed_report(sites_df: pd.DataFrame, strikes_df: pd.DataFrame, rad
                         strike['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p %Z'),
                         f"{strike['distance']:.2f} miles"
                     ])
-            
-            # Write 5-mile radius strikes
-            if strikes_5mi:
-                writer.writerow(['Strikes within 5 miles:'])
-                for strike in strikes_5mi:
-                    if strike['distance'] > radii[0]:  # Only show strikes not already listed in 1-mile radius
-                        writer.writerow([
-                            '  Strike',
-                            strike['latitude'],
-                            strike['longitude'],
-                            strike['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p %Z'),
-                            f"{strike['distance']:.2f} miles"
-                        ])
             
             # Add blank line between sites
             writer.writerow([])
@@ -299,7 +284,7 @@ def main():
         sites_df, strikes_df = load_data(site_query, strikes_query, ())
 
         # Create report for 1 and 5 mile radii
-        radii = [1.0, 5.0]
+        radii = [1.0]
 
         # Generate filename with timestamp
         timestamp = datetime.now(pytz.timezone('America/Chicago')).strftime('%Y%m%d_%H%M%S')
