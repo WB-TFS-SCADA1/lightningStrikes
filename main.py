@@ -172,6 +172,7 @@ def load_data(site_query: str, strikes_query: str, query_params: Tuple) -> Tuple
     conn.close()
     return sites_df, strikes_df
 
+
 def get_strikes_for_site(site_row: pd.Series, strikes_df: pd.DataFrame, radius_miles: float) -> List[Dict]:
     """
     Get all strikes within radius of a site with their details
@@ -179,42 +180,44 @@ def get_strikes_for_site(site_row: pd.Series, strikes_df: pd.DataFrame, radius_m
     try:
         site_lat = float(site_row['Latitude'])
         site_lon = float(site_row['Longitude'])
-        
+
         if not validate_coordinates(site_lat, site_lon):
             print(f"Warning: Invalid coordinates for site {site_row['SiteName']}: {site_lat}, {site_lon}")
             return []
-        
+
         site_coords = (site_lat, site_lon)  # Note: order is (lat, lon)
     except (ValueError, TypeError) as e:
         print(f"Error parsing coordinates for site {site_row['SiteName']}: {e}")
         return []
-    
+
     strikes_in_radius = []
-    
+
     for _, strike in strikes_df.iterrows():
         try:
             strike_lat = float(strike['Latitude'])
             strike_lon = float(strike['Longitude'])
-            
+
             if not validate_coordinates(strike_lat, strike_lon):
                 continue
-                
+
             strike_coords = (strike_lat, strike_lon)  # Note: order is (lat, lon)
             distance = geodesic(site_coords, strike_coords).miles
-            
+
             if distance <= radius_miles:
                 strikes_in_radius.append({
                     'latitude': strike_lat,
                     'longitude': strike_lon,
                     'timestamp': strike['Timestamp'],
-                    'distance': distance
+                    'distance': distance,
+                    'peakamp': strike['PeakAmp']  # Added PeakAmp to the dictionary
                 })
         except (ValueError, TypeError) as e:
             print(f"Error processing strike coordinates: {e}")
             continue
-    
+
     # Sort strikes by timestamp
     return sorted(strikes_in_radius, key=lambda x: x['timestamp'])
+
 
 def create_detailed_report(sites_df: pd.DataFrame, strikes_df: pd.DataFrame, radii: List[float], filename: str) -> int:
     """
@@ -222,22 +225,22 @@ def create_detailed_report(sites_df: pd.DataFrame, strikes_df: pd.DataFrame, rad
     Returns the number of sites with strikes
     """
     sites_with_strikes = 0
-    
+
     with open(filename, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['Site Name', 'Latitude', 'Longitude', 
-                        f'Strikes ({radii[0]} mi)'])
-        
+        writer.writerow(['Site Name', 'Latitude', 'Longitude',
+                         f'Strikes ({radii[0]} mi)'])
+
         for _, site in sites_df.iterrows():
             # Get strikes for each radius
             strikes_1mi = get_strikes_for_site(site, strikes_df, radii[0])
-            
+
             # Skip sites with no strikes in either radius
             if not strikes_1mi:
                 continue
-                
+
             sites_with_strikes += 1
-            
+
             # Write site summary row
             writer.writerow([
                 site['SiteName'],
@@ -245,7 +248,7 @@ def create_detailed_report(sites_df: pd.DataFrame, strikes_df: pd.DataFrame, rad
                 site['Longitude'],
                 len(strikes_1mi)
             ])
-            
+
             # Write 1-mile radius strikes
             if strikes_1mi:
                 writer.writerow(['Strikes within 1 mile:'])
@@ -255,12 +258,13 @@ def create_detailed_report(sites_df: pd.DataFrame, strikes_df: pd.DataFrame, rad
                         strike['latitude'],
                         strike['longitude'],
                         strike['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p %Z'),
-                        f"{strike['distance']:.2f} miles"
+                        f"{strike['distance']:.2f} miles",
+                        f"{strike['peakamp']} kA"  # Added PeakAmp to the output
                     ])
-            
+
             # Add blank line between sites
             writer.writerow([])
-    
+
     return sites_with_strikes
 
 def main():
@@ -273,8 +277,10 @@ def main():
         """
 
         strikes_query = """
-        SELECT Latitude, Longitude, [Timestamp]
+        SELECT Latitude, Longitude, PeakAmp, [Timestamp]
         FROM LightningStrikes 
+        left join Pulses
+		on LightningStrikes.id = Pulses.StrikeID
         WHERE Latitude IS NOT NULL 
         AND Longitude IS NOT NULL 
         AND [Timestamp] >= DATEADD(day, -7, GETDATE())
