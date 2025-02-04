@@ -17,6 +17,7 @@ from email import encoders
 import logging
 from logging.config import dictConfig
 import traceback
+import requests  # Add this import at the top with other imports
 
 if getattr(sys, 'frozen', False):
     currentDir = os.path.dirname(sys.executable)
@@ -116,7 +117,7 @@ def emailReport(filename, emailMsg, emailSubject):
             logger.info("Sending email")
             server.sendmail(
                 config['emailUser'],
-                ["chris.morris@h2obridge.com", "joey.philippi@h2obridge.com", "charles.lame@h2obridge.com"],
+                config['businessEmails'].split(','),
                 msg.as_string()
             )
             logger.info("Email sent successfully")
@@ -267,53 +268,214 @@ def create_detailed_report(sites_df: pd.DataFrame, strikes_df: pd.DataFrame, rad
 
     return sites_with_strikes
 
+def get_work_orders():
+    """
+    Fetch work orders from the API
+    """
+    logger.info("Fetching work orders from API")
+    try:
+        response = requests.get("https://wbrapi.azurewebsites.net/api/Fiix/WorkOrder")
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        logger.error(f"Error fetching work orders: {str(e)}")
+        raise
+
+def create_correlation_report(sites_df: pd.DataFrame, strikes_df: pd.DataFrame, work_orders: list, 
+                            radii: List[float], filename: str) -> int:
+    """
+    Create a report correlating lightning strikes with work orders
+    Only includes strikes that have associated work orders
+    """
+    sites_with_data = 0
+    
+    # Convert work orders to DataFrame and parse dates with UTC timezone
+    wo_df = pd.DataFrame(work_orders)
+    wo_df['createdDateTime'] = pd.to_datetime(wo_df['createdDateTime'], format='ISO8601', utc=True)
+    
+    # Filter work orders to last 14 days (using UTC)
+    cutoff_date = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=14)
+    wo_df = wo_df[wo_df['createdDateTime'] >= cutoff_date]
+
+    with open(filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Site Name', 'Latitude', 'Longitude', f'Strikes ({radii[0]} mi)'])
+
+        for _, site in sites_df.iterrows():
+            # Get all strikes for the site
+            all_strikes = get_strikes_for_site(site, strikes_df, radii[0])
+            
+            if not all_strikes:
+                continue
+            
+            # Filter work orders for this site
+            site_work_orders = wo_df[wo_df['facilityID'] == site['facilityid']]
+            
+            if site_work_orders.empty:
+                continue
+            
+            # Filter strikes to only those that have associated work orders
+            strikes_with_orders = []
+            for strike in all_strikes:
+                strike_time = strike['timestamp']
+                if not strike_time.tzinfo:
+                    strike_time = pd.Timestamp(strike_time, tz='UTC')
+                else:
+                    strike_time = pd.Timestamp(strike_time).tz_convert('UTC')
+                
+                # Check if there are any work orders after this strike
+                matching_orders = site_work_orders[
+                    site_work_orders['createdDateTime'] >= strike_time
+                ]
+                
+                if not matching_orders.empty:
+                    strikes_with_orders.append(strike)
+            
+            # Skip if no strikes have associated work orders
+            if not strikes_with_orders:
+                continue
+                
+            sites_with_data += 1
+            
+            # Write site summary row
+            writer.writerow([
+                site['SiteName'],
+                site['Latitude'],
+                site['Longitude'],
+                len(strikes_with_orders)  # Only count strikes with work orders
+            ])
+
+            # Write strikes that have work orders
+            writer.writerow(['Strikes within 1 mile:'])
+            for strike in strikes_with_orders:
+                writer.writerow([
+                    '  Strike',
+                    strike['latitude'],
+                    strike['longitude'],
+                    strike['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p %Z'),
+                    f"{strike['distance']:.2f} miles",
+                    f"{strike['peakamp']} kA"
+                ])
+            
+            # Write associated work orders
+            writer.writerow(['Work Orders Past 14 Days:'])
+            writer.writerow(['  Work Order Number', 'Asset Name', 'Maintenance Type', 
+                           'Work Order Description', 'Created Date'])
+            
+            # Get earliest strike time
+            earliest_strike = min(strike['timestamp'] for strike in strikes_with_orders)
+            if not earliest_strike.tzinfo:
+                earliest_strike = pd.Timestamp(earliest_strike, tz='UTC')
+            else:
+                earliest_strike = pd.Timestamp(earliest_strike).tz_convert('UTC')
+            
+            # Filter and write work orders
+            relevant_orders = site_work_orders[
+                site_work_orders['createdDateTime'] >= earliest_strike
+            ]
+            
+            for _, wo in relevant_orders.iterrows():
+                created_time = wo['createdDateTime'].tz_convert('America/Chicago')
+                writer.writerow([
+                    f"  {wo['woNumber']}",
+                    wo['assetName'],
+                    wo['maintenanceType'],
+                    wo['workOrderDesc'],
+                    created_time.strftime('%Y-%m-%d %I:%M:%S %p %Z')
+                ])
+            
+            # Add blank line between sites
+            writer.writerow([])
+    
+    return sites_with_data
+
 def main():
     try:
-        # SQL queries
+        # SQL queries for 7-day report
         site_query = """
-        SELECT SiteName, Latitude, Longitude 
+        SELECT SiteName, Latitude, Longitude, site.id, facilityid
         FROM site 
-        WHERE Latitude IS NOT NULL AND Longitude IS NOT NULL and site.type not in ('Remote') and site.enabled = 1
+        WHERE Latitude IS NOT NULL AND Longitude IS NOT NULL and site.type not in ('Remote', 'Variance') and site.enabled = 1
         """
 
-        strikes_query = """
+        strikes_query_7d = """
         SELECT Latitude, Longitude, PeakAmp, [Timestamp]
         FROM LightningStrikes 
         left join Pulses
-		on LightningStrikes.id = Pulses.StrikeID
+        on LightningStrikes.id = Pulses.StrikeID
         WHERE Latitude IS NOT NULL 
         AND Longitude IS NOT NULL 
         AND [Timestamp] >= DATEADD(day, -7, GETDATE())
         """
 
-        # Load data
-        sites_df, strikes_df = load_data(site_query, strikes_query, ())
-
-        # Create report for 1 and 5 mile radii
-        radii = [1.0]
+        # Load data for 7-day report
+        sites_df, strikes_df_7d = load_data(site_query, strikes_query_7d, ())
 
         # Generate filename with timestamp
         timestamp = datetime.now(pytz.timezone('America/Chicago')).strftime('%Y%m%d_%H%M%S')
         filename = (f'{currentDir}/detailed_lightning_report_{timestamp}.csv')
 
-        # Create the detailed report and get count of sites with strikes
-        sites_with_strikes = create_detailed_report(sites_df, strikes_df, radii, filename)
+        # Create the 7-day report
+        sites_with_strikes = create_detailed_report(sites_df, strikes_df_7d, [1.0], filename)
+
+        # SQL query for 14-day strikes
+        strikes_query_14d = """
+        SELECT Latitude, Longitude, PeakAmp, [Timestamp]
+        FROM LightningStrikes 
+        left join Pulses
+        on LightningStrikes.id = Pulses.StrikeID
+        WHERE Latitude IS NOT NULL 
+        AND Longitude IS NOT NULL 
+        AND [Timestamp] >= DATEADD(day, -14, GETDATE())
+        """
+
+        # Load data for 14-day correlation report
+        _, strikes_df_14d = load_data(site_query, strikes_query_14d, ())
+
+        # Get work orders
+        work_orders = get_work_orders()
+        
+        # Generate correlation report filename
+        correlation_filename = f'{currentDir}/lightning_strike_wo_correlation_report_{timestamp}.csv'
+        
+        # Create correlation report with 14-day strike data
+        sites_with_data = create_correlation_report(
+            sites_df, 
+            strikes_df_14d,  # Using 14-day strike data
+            work_orders, 
+            [1.0], 
+            correlation_filename
+        )
 
         # Print summary
         central_now = datetime.now(pytz.timezone('America/Chicago'))
         utc_now = central_now.astimezone(pytz.UTC)
 
-        logger.info(f"\nReport saved as: {filename}")
-        logger.info(f"Total lightning strikes analyzed: {len(strikes_df)}")
+        logger.info(f"\nReports saved as:")
+        logger.info(f"7-day report: {filename}")
+        logger.info(f"14-day correlation report: {correlation_filename}")
+        logger.info(f"\n7-day report summary:")
+        logger.info(f"Total lightning strikes analyzed: {len(strikes_df_7d)}")
         logger.info(f"Total sites analyzed: {len(sites_df)}")
         logger.info(f"Sites with strikes: {sites_with_strikes}")
         logger.info(f"Sites without strikes: {len(sites_df) - sites_with_strikes}")
-        logger.info(f"Date range: Last 7 days from {central_now.strftime('%Y-%m-%d %I:%M:%S %p %Z')}")
-        logger.info(f"Query start time (UTC): {utc_now - timedelta(days=7)}")
+        logger.info(f"\n14-day correlation report summary:")
+        logger.info(f"Total lightning strikes analyzed: {len(strikes_df_14d)}")
+        logger.info(f"Sites with correlated data: {sites_with_data}")
+        logger.info(f"\nDate ranges:")
+        logger.info(f"7-day report: Last 7 days from {central_now.strftime('%Y-%m-%d %I:%M:%S %p %Z')}")
+        logger.info(f"14-day report: Last 14 days from {central_now.strftime('%Y-%m-%d %I:%M:%S %p %Z')}")
+        
+        # Send both reports
         emailReport(filename,
-                        f"Lightning report attached.",
-                        f"Weekly Lightning Strike Report")
-    except:
+                   f"Lightning report (7-day) attached.",
+                   f"Weekly Lightning Strike Report")
+        
+        emailReport(correlation_filename,
+                   f"Lightning strike and work order correlation report (14-day) attached.",
+                   f"Weekly Lightning Strike and Work Order Correlation Report")
+                   
+    except Exception as e:
         print(f"Script {currentFile} has failed:\n {traceback.format_exc()}", 'html')
 
         logger.info(traceback.format_exc())
