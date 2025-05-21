@@ -18,6 +18,9 @@ import logging
 from logging.config import dictConfig
 import traceback
 import requests  # Add this import at the top with other imports
+from openpyxl import Workbook  # Added for Excel
+from openpyxl.styles import Alignment # Added for cell alignment/word wrap
+from openpyxl.utils import get_column_letter # Added for column width adjustment
 
 if getattr(sys, 'frozen', False):
     currentDir = os.path.dirname(sys.executable)
@@ -91,13 +94,22 @@ def emailReport(filename, emailMsg, emailSubject):
         # Attach file
         logger.info(f"Attaching file: {filename}")
         with open(filename, "rb") as attachment:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(attachment.read())
-        encoders.encode_base64(part)
-        part.add_header(
-            "Content-Disposition",
-            f"attachment; filename= {os.path.basename(filename)}",
-        )
+            if filename.endswith(".xlsx"):
+                part = MIMEBase("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                part.set_payload(attachment.read())
+                encoders.encode_base64(part)
+                part.add_header(
+                    "Content-Disposition",
+                    f"attachment; filename={os.path.basename(filename)}",
+                )
+            else: # Assuming CSV or other, fallback to octet-stream
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(attachment.read())
+                encoders.encode_base64(part)
+                part.add_header(
+                    "Content-Disposition",
+                    f"attachment; filename={os.path.basename(filename)}",
+                )
         msg.attach(part)
 
         context = ssl.create_default_context()
@@ -227,45 +239,77 @@ def create_detailed_report(sites_df: pd.DataFrame, strikes_df: pd.DataFrame, rad
     """
     sites_with_strikes = 0
 
-    with open(filename, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Site Name', 'Latitude', 'Longitude',
-                         f'Strikes ({radii[0]} mi)'])
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Detailed Lightning Report"
 
-        for _, site in sites_df.iterrows():
-            # Get strikes for each radius
-            strikes_1mi = get_strikes_for_site(site, strikes_df, radii[0])
+    # Write header row
+    header = ['Site Name', 'Latitude', 'Longitude',
+              f'Strikes ({radii[0]} mi)']
+    ws.append(header)
 
-            # Skip sites with no strikes in either radius
-            if not strikes_1mi:
-                continue
+    for _, site in sites_df.iterrows():
+        # Get strikes for each radius
+        strikes_1mi = get_strikes_for_site(site, strikes_df, radii[0])
 
-            sites_with_strikes += 1
+        # Skip sites with no strikes in either radius
+        if not strikes_1mi:
+            continue
 
-            # Write site summary row
-            writer.writerow([
-                site['SiteName'],
-                site['Latitude'],
-                site['Longitude'],
-                len(strikes_1mi)
-            ])
+        sites_with_strikes += 1
 
-            # Write 1-mile radius strikes
-            if strikes_1mi:
-                writer.writerow(['Strikes within 1 mile:'])
-                for strike in strikes_1mi:
-                    writer.writerow([
-                        '  Strike',
-                        strike['latitude'],
-                        strike['longitude'],
-                        strike['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p %Z'),
-                        f"{strike['distance']:.2f} miles",
-                        f"{strike['peakamp']} kA"  # Added PeakAmp to the output
-                    ])
+        # Write site summary row
+        ws.append([
+            site['SiteName'],
+            site['Latitude'],
+            site['Longitude'],
+            len(strikes_1mi)
+        ])
 
-            # Add blank line between sites
-            writer.writerow([])
+        # Write 1-mile radius strikes
+        if strikes_1mi:
+            ws.append(['Strikes within 1 mile:'])
+            for strike in strikes_1mi:
+                ws.append([
+                    '  Strike',
+                    strike['latitude'],
+                    strike['longitude'],
+                    strike['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p %Z'),
+                    f"{strike['distance']:.2f} miles",
+                    f"{strike['peakamp']} kA"
+                ])
 
+        # Add blank line between sites
+        ws.append([])
+
+    # Auto-size columns for better readability
+    for col_idx, column_cells in enumerate(ws.columns):
+        max_length = 0
+        for cell in column_cells:
+            try:
+                if cell.value is not None:
+                    lines = str(cell.value).split('\n')
+                    cell_len = 0
+                    if lines:
+                        cell_len = max(len(line) for line in lines)
+                    
+                    if cell_len > max_length:
+                        max_length = cell_len
+            except:
+                pass 
+        
+        column_letter = get_column_letter(col_idx + 1)
+        adjusted_width = (max_length + 2) 
+        if adjusted_width > 50: 
+             adjusted_width = 50
+        if adjusted_width < 10 and column_letter == 'A':
+            adjusted_width = 10
+        elif adjusted_width < 5:
+             adjusted_width = 5
+
+        ws.column_dimensions[column_letter].width = adjusted_width
+
+    wb.save(filename)
     return sites_with_strikes
 
 def get_work_orders():
@@ -289,6 +333,10 @@ def create_correlation_report(sites_df: pd.DataFrame, strikes_df: pd.DataFrame, 
     """
     sites_with_data = 0
     
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Lightning WO Correlation"
+
     # Convert work orders to DataFrame and parse dates with UTC timezone
     wo_df = pd.DataFrame(work_orders)
     wo_df['createdDateTime'] = pd.to_datetime(wo_df['createdDateTime'], format='ISO8601', utc=True)
@@ -297,96 +345,142 @@ def create_correlation_report(sites_df: pd.DataFrame, strikes_df: pd.DataFrame, 
     cutoff_date = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=14)
     wo_df = wo_df[wo_df['createdDateTime'] >= cutoff_date]
 
-    with open(filename, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Site Name', 'Latitude', 'Longitude', f'Strikes ({radii[0]} mi)'])
+    # Write header row
+    header = ['Site Name', 'Latitude', 'Longitude', f'Strikes ({radii[0]} mi)']
+    ws.append(header)
 
-        for _, site in sites_df.iterrows():
-            # Get all strikes for the site
-            all_strikes = get_strikes_for_site(site, strikes_df, radii[0])
-            
-            if not all_strikes:
-                continue
-            
-            # Filter work orders for this site
-            site_work_orders = wo_df[wo_df['facilityID'] == site['facilityid']]
-            
-            if site_work_orders.empty:
-                continue
-            
-            # Filter strikes to only those that have associated work orders
-            strikes_with_orders = []
-            for strike in all_strikes:
-                strike_time = strike['timestamp']
-                if not strike_time.tzinfo:
-                    strike_time = pd.Timestamp(strike_time, tz='UTC')
-                else:
-                    strike_time = pd.Timestamp(strike_time).tz_convert('UTC')
-                
-                # Check if there are any work orders after this strike
-                matching_orders = site_work_orders[
-                    site_work_orders['createdDateTime'] >= strike_time
-                ]
-                
-                if not matching_orders.empty:
-                    strikes_with_orders.append(strike)
-            
-            # Skip if no strikes have associated work orders
-            if not strikes_with_orders:
-                continue
-                
-            sites_with_data += 1
-            
-            # Write site summary row
-            writer.writerow([
-                site['SiteName'],
-                site['Latitude'],
-                site['Longitude'],
-                len(strikes_with_orders)  # Only count strikes with work orders
-            ])
+    # Define column index for Work Order Description (0-indexed)
+    # Assuming header for work orders is ['Work Order Number', 'Asset Name', 'Maintenance Type', 'Work Order Description', 'Created Date']
+    # The full row for work orders is ['', 'Work Order Number', 'Asset Name', 'Maintenance Type', 'Work Order Description', 'Created Date']
+    # So, if 'Work Order Description' is the 4th item in its own header, and there's an empty cell before the WO details, it will be column E (index 4)
+    work_order_desc_col_letter = 'E' # This might need adjustment based on actual output structure
 
-            # Write strikes that have work orders
-            writer.writerow(['Strikes within 1 mile:'])
-            for strike in strikes_with_orders:
-                writer.writerow([
-                    '  Strike',
-                    strike['latitude'],
-                    strike['longitude'],
-                    strike['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p %Z'),
-                    f"{strike['distance']:.2f} miles",
-                    f"{strike['peakamp']} kA"
-                ])
+    for _, site in sites_df.iterrows():
+        all_strikes = get_strikes_for_site(site, strikes_df, radii[0])
+        if not all_strikes:
+            continue
+        
+        site_work_orders = wo_df[wo_df['facilityID'] == site['facilityid']]
+        if site_work_orders.empty:
+            continue
             
-            # Write associated work orders
-            writer.writerow(['Work Orders Past 14 Days:'])
-            writer.writerow(['  Work Order Number', 'Asset Name', 'Maintenance Type', 
-                           'Work Order Description', 'Created Date'])
-            
-            # Get earliest strike time
-            earliest_strike = min(strike['timestamp'] for strike in strikes_with_orders)
-            if not earliest_strike.tzinfo:
-                earliest_strike = pd.Timestamp(earliest_strike, tz='UTC')
+        strikes_with_orders = []
+        for strike in all_strikes:
+            strike_time = strike['timestamp']
+            if not strike_time.tzinfo:
+                strike_time = pd.Timestamp(strike_time, tz='UTC')
             else:
-                earliest_strike = pd.Timestamp(earliest_strike).tz_convert('UTC')
+                strike_time = pd.Timestamp(strike_time).tz_convert('UTC')
             
-            # Filter and write work orders
-            relevant_orders = site_work_orders[
-                site_work_orders['createdDateTime'] >= earliest_strike
+            matching_orders = site_work_orders[
+                site_work_orders['createdDateTime'] >= strike_time
             ]
-            
-            for _, wo in relevant_orders.iterrows():
-                created_time = wo['createdDateTime'].tz_convert('America/Chicago')
-                writer.writerow([
-                    f"  {wo['woNumber']}",
-                    wo['assetName'],
-                    wo['maintenanceType'],
-                    wo['workOrderDesc'],
-                    created_time.strftime('%Y-%m-%d %I:%M:%S %p %Z')
-                ])
-            
-            # Add blank line between sites
-            writer.writerow([])
+            if not matching_orders.empty:
+                strikes_with_orders.append(strike)
+        
+        if not strikes_with_orders:
+            continue
+                
+        sites_with_data += 1
+        
+        ws.append([
+            site['SiteName'],
+            site['Latitude'],
+            site['Longitude'],
+            len(strikes_with_orders)
+        ])
+
+        ws.append(['Strikes within 1 mile:'])
+        for strike in strikes_with_orders:
+            ws.append([
+                '  Strike',
+                strike['latitude'],
+                strike['longitude'],
+                strike['timestamp'].strftime('%Y-%m-%d %I:%M:%S %p %Z'),
+                f"{strike['distance']:.2f} miles",
+                f"{strike['peakamp']} kA"
+            ])
+        
+        ws.append(['Work Orders Past 14 Days:'])
+        wo_header = ['  Work Order Number', 'Asset Name', 'Maintenance Type', 
+                       'Work Order Description', 'Created Date']
+        ws.append(wo_header)
+        
+        earliest_strike = min(strike['timestamp'] for strike in strikes_with_orders)
+        if not earliest_strike.tzinfo:
+            earliest_strike = pd.Timestamp(earliest_strike, tz='UTC')
+        else:
+            earliest_strike = pd.Timestamp(earliest_strike).tz_convert('UTC')
+        
+        relevant_orders = site_work_orders[
+            site_work_orders['createdDateTime'] >= earliest_strike
+        ]
+        
+        for _, wo in relevant_orders.iterrows():
+            # Filter out work orders containing the specified phrase
+            if "Could not send Truck Unloading tags to " in str(wo['workOrderDesc']):
+                continue
+
+            created_time = wo['createdDateTime'].tz_convert('America/Chicago')
+            # work_order_desc_excel_friendly = str(wo['workOrderDesc']).replace('\n', ' ').replace('\r', '') # No longer needed, handled by word wrap
+            row_data = [
+                f"  {wo['woNumber']}",
+                wo['assetName'],
+                wo['maintenanceType'],
+                str(wo['workOrderDesc']), # Keep original newlines for word wrap
+                created_time.strftime('%Y-%m-%d %I:%M:%S %p %Z')
+            ]
+            ws.append(row_data)
+            # Apply word wrap to the Work Order Description cell
+            # The cell is in the current last row, and the column letter is determined above.
+            # Need to find the column index for 'Work Order Description' in wo_header
+            try:
+                desc_col_index = wo_header.index('Work Order Description')
+                # Convert 0-indexed column to 1-indexed for openpyxl cell access
+                # The first element in row_data (woNumber) might be indented, so direct indexing might be off.
+                # Let's find the actual column letter for 'Work Order Description' based on the `row_data` structure.
+                # If wo_header is [A, B, C, D, E] and row_data is [A, B, C, D, E]
+                # And 'Work Order Description' is D in wo_header, then it's the 4th item in row_data.
+                # openpyxl columns are 1-indexed. So, column D is 4.
+                # The items in wo_header are: '  Work Order Number', 'Asset Name', 'Maintenance Type', 'Work Order Description', 'Created Date'
+                # The items in row_data are: f"  {wo['woNumber']}", wo['assetName'], wo['maintenanceType'], str(wo['workOrderDesc']), created_time.strftime(...)
+                # So 'Work Order Description' is the 4th element (index 3) in row_data.
+                # Therefore, the column is 3 + 1 = 4 (D)
+                target_cell = ws.cell(row=ws.max_row, column=desc_col_index + 1) # desc_col_index is 0-based from wo_header
+                target_cell.alignment = Alignment(wrap_text=True, vertical='top')
+            except ValueError:
+                logger.warning("Could not find 'Work Order Description' in work order header for wrapping.")
+
+        ws.append([])
     
+    # Auto-size columns for better readability
+    for col_idx, column_cells in enumerate(ws.columns):
+        max_length = 0
+        for cell in column_cells:
+            try:
+                if cell.value is not None:
+                    lines = str(cell.value).split('\n')
+                    cell_len = 0
+                    if lines:
+                        cell_len = max(len(line) for line in lines)
+                    
+                    if cell_len > max_length:
+                        max_length = cell_len
+            except:
+                pass 
+        
+        column_letter = get_column_letter(col_idx + 1)
+        adjusted_width = (max_length + 2) 
+        if adjusted_width > 50: 
+             adjusted_width = 50
+        if adjusted_width < 10 and column_letter == 'A':
+            adjusted_width = 10
+        elif adjusted_width < 5:
+             adjusted_width = 5
+
+        ws.column_dimensions[column_letter].width = adjusted_width
+
+    wb.save(filename)
     return sites_with_data
 
 def main():
@@ -395,7 +489,7 @@ def main():
         site_query = """
         SELECT SiteName, Latitude, Longitude, site.id, facilityid
         FROM site 
-        WHERE Latitude IS NOT NULL AND Longitude IS NOT NULL and site.type not in ('Remote', 'Variance') and site.enabled = 1
+        WHERE Latitude IS NOT NULL AND Longitude IS NOT NULL and site.type in ('Salt Water Disposal', 'Truck Transfer') and site.enabled = 1
         """
 
         strikes_query_7d = """
@@ -405,6 +499,7 @@ def main():
         on LightningStrikes.id = Pulses.StrikeID
         WHERE Latitude IS NOT NULL 
         AND Longitude IS NOT NULL 
+        and pulses.type = 'cg'
         AND [Timestamp] >= DATEADD(day, -7, GETDATE())
         """
 
@@ -413,7 +508,7 @@ def main():
 
         # Generate filename with timestamp
         timestamp = datetime.now(pytz.timezone('America/Chicago')).strftime('%Y%m%d_%H%M%S')
-        filename = (f'{currentDir}/detailed_lightning_report_{timestamp}.csv')
+        filename = (f'{currentDir}/detailed_lightning_report_{timestamp}.xlsx')
 
         # Create the 7-day report
         sites_with_strikes = create_detailed_report(sites_df, strikes_df_7d, [1.0], filename)
@@ -436,7 +531,7 @@ def main():
         work_orders = get_work_orders()
         
         # Generate correlation report filename
-        correlation_filename = f'{currentDir}/lightning_strike_wo_correlation_report_{timestamp}.csv'
+        correlation_filename = f'{currentDir}/lightning_strike_wo_correlation_report_{timestamp}.xlsx'
         
         # Create correlation report with 14-day strike data
         sites_with_data = create_correlation_report(
