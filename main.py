@@ -159,11 +159,13 @@ def validate_coordinates(lat: float, lon: float) -> bool:
 
 def load_data(site_query: str, strikes_query: str, query_params: Tuple) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Load data from SQL Server database
+    Load data from SQL Server database (sites) and PostgreSQL database (lightning strikes)
     """
     import pyodbc
+    import psycopg2
     
-    conn = pyodbc.connect(
+    # Connect to SQL Server for sites
+    sql_server_conn = pyodbc.connect(
         f'DRIVER={{ODBC Driver 17 for SQL Server}};'
         f'SERVER={config["sqlServer"]};'
         f'DATABASE={config["sqlDatabase"]};'
@@ -171,9 +173,17 @@ def load_data(site_query: str, strikes_query: str, query_params: Tuple) -> Tuple
         f'PWD={config["sqlPassword"]}'
     )
     
+    # Connect to PostgreSQL for lightning strikes
+    pg_conn = psycopg2.connect(
+        host=config['PG_HOST'],
+        database=config['PG_DATABASE'],
+        user=config['PG_USER'],
+        password=config['PG_PASSWORD']
+    )
+    
     # Load the data
-    sites_df = pd.read_sql(site_query, conn)
-    strikes_df = pd.read_sql(strikes_query, conn, params=query_params)
+    sites_df = pd.read_sql(site_query, sql_server_conn)
+    strikes_df = pd.read_sql(strikes_query, pg_conn, params=query_params)
     
     # Convert UTC timestamps to Central Time
     central = pytz.timezone('America/Chicago')
@@ -182,7 +192,8 @@ def load_data(site_query: str, strikes_query: str, query_params: Tuple) -> Tuple
         lambda x: x.replace(tzinfo=pytz.UTC).astimezone(central)
     )
     
-    conn.close()
+    sql_server_conn.close()
+    pg_conn.close()
     return sites_df, strikes_df
 
 
@@ -493,14 +504,12 @@ def main():
         """
 
         strikes_query_7d = """
-        SELECT Latitude, Longitude, PeakAmp, [Timestamp]
-        FROM LightningStrikes 
-        left join Pulses
-        on LightningStrikes.id = Pulses.StrikeID
-        WHERE Latitude IS NOT NULL 
-        AND Longitude IS NOT NULL 
-        and pulses.type = 'cg'
-        AND [Timestamp] >= DATEADD(day, -7, GETDATE())
+        SELECT latitude AS Latitude, longitude AS Longitude, peak_amp AS PeakAmp, strike_timestamp AS Timestamp
+        FROM public.lightning_strikes
+        WHERE latitude IS NOT NULL 
+        AND longitude IS NOT NULL 
+        AND pulse_type = 'cg'
+        AND strike_timestamp >= NOW() - INTERVAL '7 days'
         """
 
         # Load data for 7-day report
@@ -515,13 +524,11 @@ def main():
 
         # SQL query for 14-day strikes
         strikes_query_14d = """
-        SELECT Latitude, Longitude, PeakAmp, [Timestamp]
-        FROM LightningStrikes 
-        left join Pulses
-        on LightningStrikes.id = Pulses.StrikeID
-        WHERE Latitude IS NOT NULL 
-        AND Longitude IS NOT NULL 
-        AND [Timestamp] >= DATEADD(day, -14, GETDATE())
+        SELECT latitude AS Latitude, longitude AS Longitude, peak_amp AS PeakAmp, strike_timestamp AS Timestamp
+        FROM public.lightning_strikes
+        WHERE latitude IS NOT NULL 
+        AND longitude IS NOT NULL 
+        AND strike_timestamp >= NOW() - INTERVAL '14 days'
         """
 
         # Load data for 14-day correlation report
@@ -529,6 +536,9 @@ def main():
 
         # Get work orders
         work_orders = get_work_orders()
+        print("=============================")
+        print(len(work_orders))
+        print("=============================")
         
         # Generate correlation report filename
         correlation_filename = f'{currentDir}/lightning_strike_wo_correlation_report_{timestamp}.xlsx'
